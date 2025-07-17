@@ -1,6 +1,27 @@
 # AutoTab
 Here you will find full interactive code to train Variational Autoencoders for Tabular Data. This code will hopefully be turned into a package soon! For now, it can still be used in the "package" sense. 
 
+Set up your enviorment:
+
+Python / Tensorflow / Numpy
+- python version:        3.10.8 | packaged by conda-forge | (main, Nov 22 2022, 08:16:53) [MSC v.1929 64 bit (AMD64)]
+- numpy_version:  1.26.4
+- tensorflow version: 2.10.0
+
+Reticulate
+- #install_miniconda()   #only need to do once
+- #reticulate::py_install("tensorflow", force = TRUE)
+- reticulate::use_condaenv("r-reticulate")   #run every time
+Libraries 
+-  library(caret) #for one-hot-coding
+-  library(readr) #for importing the data
+-  library(dplyr) #for renaming columns
+-  library(R6)
+-  library(keras)
+-  library(tensorflow)
+-  library(reticulate)
+-  tfa <- import("tensorflow_addons")
+
 Running the code:
 
 Run the full code to ensure all of the functions and in your enviorment. 
