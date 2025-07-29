@@ -1,0 +1,657 @@
+################################################################################
+#Program: Final Version 3
+#Author: Sarah Milligan
+#Email: slm1999@bu.edu
+################################################################################
+#install_miniconda() #If you have not done this on your local R it will need to be done, only once
+#reticulate::py_install("tensorflow", force = TRUE) #Potentially needed
+reticulate::use_condaenv("r-reticulate")
+
+reticulate::py_config() #this should pull the version of python being used and will indicate that the R is accessing python correctly. 
+reticulate::py_run_string("import tensorflow as tf; print(tf.__version__)")  #this should output a version type, this means we have access to tesnorflow, ensure it matches that outlined in GitHub
+
+
+#############
+# LIBRARIES #
+#############
+
+library(caret) #for one-hot-coding
+library(dplyr) #for renaming columns
+library(R6)
+library(keras)
+library(tensorflow)
+library(reticulate)
+
+py_list_packages()
+
+tfa <- import("tensorflow_addons")
+
+###############################
+#Getting Feature Distributions#
+###############################
+
+extracting_distribution = function(data){
+  # Create a data set that the following information will fill in
+  feat_dist = data.frame(
+    column_name = colnames(data), 
+    distribution = character(length(colnames(data))), 
+    num_params = integer(length(colnames(data)))  ) 
+  for (i in 1:ncol(data)) {
+    variable = data[[i]] 
+    name = colnames(data)[i]
+    if(is.numeric(variable) && length(unique(variable))>2){ #A numeric column with more than 2 distinct values 
+      feat_dist$distribution[i] = "gaussian"
+      feat_dist$num_params[i] = 2     } #mean and SD
+    else if (length(unique(variable))==2){ 
+      feat_dist$distribution[i] = "bernoulli"
+      feat_dist$num_params[i] = 1     }
+    else if ((is.character(variable) || is.factor(variable)) && length(unique(variable))>2){ 
+      feat_dist$distribution[i] = "categorical"
+      feat_dist$num_params[i] = length(unique(variable))  }}
+    return(feat_dist)}
+
+
+#Make sure order matches the data
+feat_reorder = function(feat_dist,data){
+  #Reorder to match the order in the data
+  feat_names <- feat_dist$column_name  
+  
+  get_original_var <- function(colname, vars) {
+    match <- vars[which(startsWith(colname, vars))]
+    if (length(match) > 0) return(match[1]) else return(NA)}
+  
+  dummy_cols <- colnames(data)
+  dummy_to_original <- sapply(dummy_cols, get_original_var, vars = feat_names)
+  ordered_original_vars <- unique(dummy_to_original)
+  feat_dist <- feat_dist[match(ordered_original_vars, feat_dist$column_name), ]
+  return(feat_dist)}
+
+#######################
+#Sampling latent space#
+#######################
+
+Latent_sample = function(z_mean, z_log_var){
+  z_mean = tf$cast(z_mean, dtype = tf$float32)
+  z_log_var = tf$cast(z_log_var, dtype = tf$float32)
+  
+  z_log_var_clamped = tf$clip_by_value(z_log_var, clip_value_min = -10.0, clip_value_max = 10.0)
+  z_std = tf$maximum(tf$exp(0.5*z_log_var_clamped), 1e-3)
+  e = tf$random$normal(shape = tf$shape(z_mean)) 
+  return(z_mean + z_std*e )} 
+
+#############
+#Regularizer#
+#############
+
+KL_divergenceLayer = R6Class("KL_layer", inherit = KerasLayer,
+                             public = list(
+                               initialize= function(){},#initialize the keras layer
+                               
+                               call = function(inputs){ 
+                                 z_mean = inputs[[1]]
+                                 z_log_var = inputs[[2]]
+                                 beta = inputs[[3]]
+                                 kl_loss <- beta*(-0.5 * k_sum(1 + z_log_var - k_square(z_mean) - k_exp(z_log_var), axis = -1))
+                                 kl_loss <- k_mean(kl_loss)
+                                 return(kl_loss)
+                               }
+                             ))
+
+KL_MoG_Layer <- R6Class("KL_MoG_Layer", inherit = KerasLayer,
+                            public = list(
+                              num_components = NULL,
+                              latent_dim = NULL,
+                              learnable = FALSE,
+                              #Parameters for the prior 
+                              mog_means = NULL,
+                              mog_log_vars = NULL,
+                              mog_weights = NULL,
+                              mog_weights_logit = NULL,
+                              
+                              initialize = function(K, latent_dim, learnable = FALSE,mog_means = NULL, mog_log_vars = NULL, mog_weights = NULL) {
+                                
+                                self$num_components = K
+                                self$latent_dim = latent_dim
+                                self$learnable = learnable
+                                
+                                self$mog_means    <- mog_means       
+                                self$mog_log_vars <- mog_log_vars   
+                                self$mog_weights  <- mog_weights    
+                                
+                                
+                                if (!learnable) {
+                                  if (is.null(mog_means) || is.null(mog_log_vars) || is.null(mog_weights)) {
+                                    stop("Model will not learn MoG parameters when learnable = FALSE. mog_means,mog_log_vars, and mog_weights mys be provided. ")
+                                  }
+                                  self$mog_means = k_constant(mog_means)
+                                  self$mog_log_vars = k_constant(mog_log_vars)
+                                  self$mog_weights = k_constant(mog_weights)
+                                }        },
+                              build = function(input_shape) {
+                                if (self$learnable) {
+                                  #mog_means
+                                  init_means <- if (!is.null(self$mog_means)) 
+                                    initializer_constant(self$mog_means)
+                                  else
+                                    initializer_random_normal() 
+                                  self$mog_means <- self$add_weight(name  = "mog_means", shape  = c(self$num_components, self$latent_dim),initializer = init_means, trainable   = TRUE )
+                                 
+                                  #mog_vars
+                                  init_logv <- if (!is.null(self$mog_log_vars)) 
+                                    initializer_constant(self$mog_log_vars)
+                                  else
+                                    initializer_zeros()
+                                  self$mog_log_vars <- self$add_weight(name  = "mog_log_vars", shape = c(self$num_components, self$latent_dim),initializer = init_logv, trainable   = TRUE )
+                                  
+                                  #Weights
+                                  init_w <- if (!is.null(self$mog_weights)) 
+                                    initializer_constant(log(self$mog_weights))
+                                  else
+                                    initializer_zeros()
+                                  self$mog_weights_logit <- self$add_weight(name  = "mog_weights_logit", shape = c(self$num_components),initializer = init_w, trainable   = TRUE )
+                                  
+                                } 
+                                super$build(input_shape)     
+                                },
+                              
+                              
+                              call = function(inputs, mask = NULL) {
+                                z_sample     = inputs[[1]]
+                                z_mean       = inputs[[2]]
+                                z_log_var    = inputs[[3]]
+                                beta         = inputs[[4]]       # Weighting for beta VAE as in KL
+                               
+                                # Log probability under q(z|x) — getting Gaussian distribution of the latent space through a sample
+                                # Formula: -0.5 * ∑ (log σ² + (z - μ)² / σ² + log(2π))
+                                log_qzx = -0.5 * k_sum(
+                                  z_log_var + k_square(z_sample - z_mean) / k_exp(z_log_var) + k_log(2 * pi),
+                                  axis = -1   )
+                                
+                                # Make this sample as many times as the number of k mixtures using built in keras function 
+                                z_for_mog = k_expand_dims(z_sample, axis = 2)
+                                mog_means_exp <- k_expand_dims(self$mog_means, axis = 1)        
+                                mog_log_vars_exp <- k_expand_dims(self$mog_log_vars, axis = 1)  
+                                
+                                
+                                # Log p_k(z)- getting Gaussian distribution of the prior that were either chosen or learned 
+                                # Formula: -0.5 * ∑ (log σ² + (z - μ)² / σ² + log(2π))
+                                log_probs = -0.5 * k_sum(
+                                  (z_for_mog - mog_means_exp)^2 / k_exp(mog_log_vars_exp) +
+                                    mog_log_vars_exp + k_log(2 * pi),
+                                  axis = -1  # sum over latent dimensions
+                                ) 
+                                
+                                # Get mixture weights — softmax if learnable, otherwise use fixed
+                                mog_weights = if (self$learnable)  k_softmax(self$mog_weights_logit)
+                                else self$mog_weights
+                                
+                                # Compute log p(z) = log sum_k π_k * N_k(z) - this is an approximation through monte carlo
+                                log_mix = log_probs + k_log(mog_weights)  #TRICK: get the inside portion of the prior and put it to a log
+                                log_pz = tf$reduce_logsumexp(log_mix, axis = -1L)  #log gets undone by taking log(sum(e^log_mix)), since internal logs cancel it works out 
+                                
+                                #Monte Carlo average average over the batch (this is L)
+                                kl_loss = beta * k_mean(log_qzx - log_pz)
+                                return(kl_loss)
+                              }               ))
+
+
+layer_kl_mog <- function(object,
+                         K,
+                         latent_dim,
+                         mog_means    = NULL,
+                         mog_log_vars = NULL,
+                         mog_weights  = NULL,
+                         learnable    = FALSE,
+                         name         = NULL) {
+  create_layer(
+    KL_MoG_Layer, object,
+    list(
+      K           = as.integer(K),
+      latent_dim  = as.integer(latent_dim),
+      mog_means   = mog_means,
+      mog_log_vars= mog_log_vars,
+      mog_weights = mog_weights,
+      learnable   = learnable,
+      name        = name    )  ) }
+
+
+#Create option for KL warming:
+beta_callback <- function(beta_max = 0.01, warmup_epochs = 15) {
+  current_beta <- k_variable(0.0, dtype = "float32", name = "beta")
+  
+  callback <- callback_lambda(
+    on_epoch_begin = function(epoch, logs = NULL) {
+      new_beta <- min(1, epoch / warmup_epochs) * beta_max
+      k_set_value(current_beta, new_beta)
+      print(paste("Beta updated to:", new_beta))
+    }
+  )
+  return(list(callback = callback, beta_var = current_beta))  }
+
+#Make option for cyclical warming
+cyclical_beta_callback = function(beta_max = 0.01, total_epochs = epoch, n_cycles = 4, ratio = 0.5) {
+  current_beta = k_variable(0.0, dtype = "float32", name = "beta")
+  
+  callback = callback_lambda(
+    on_epoch_begin = function(epoch, logs = NULL) {
+      cycle_length = total_epochs / n_cycles
+      cycle_pos = epoch %% cycle_length
+      warmup_length = ratio * cycle_length
+      
+      if (cycle_pos <= warmup_length) {
+        beta = (cycle_pos / warmup_length) * beta_max
+      } else {
+        beta = beta_max
+      }
+      k_set_value(current_beta, beta)
+      print(sprintf("Cyclical Beta updated to: %.5f (epoch %d)", beta, epoch))
+    }
+  )
+  return(list(callback = callback, beta_var = current_beta))
+}
+
+#Add option for temperature warming
+temperature_callback <- function(temperature = 1.5, temp_min = 0.5, warmup_epochs = 500) {
+  current_temp <- k_variable(temperature, dtype = "float32", name = "temperature")
+  
+  callback <- callback_lambda(
+    on_epoch_begin = function(epoch, logs = NULL) {
+      new_temp <- max(temp_min, (1 - epoch / warmup_epochs) * temperature)
+      k_set_value(current_temp, new_temp)
+      print(paste("Temperature updated to:", round(new_temp, 4)))
+    }  )
+  return(list(callback = callback, temp_var = current_temp)) }
+
+#########
+#Encoder#
+######### 
+
+encoder_model = function(encoder_input,encoder_info,latent_dim, beta,Lip_en=0, pi_enc=1,prior,K =3,learnable_mog=FALSE,mog_means=NULL, mog_log_vars=NULL, mog_weights=NULL){
+  #Creating spectral normalization option
+  sn <- tfa$layers$SpectralNormalization
+  power_iterations = as.integer(pi_enc)
+  
+  #Pulling in layer and Lipschitz option
+  layer_list = list()
+  for (i in 1:length(encoder_info)) {
+    if (length(encoder_info[[i]]) < 4) {encoder_info[[i]][[4]] = 0}
+    if (length(encoder_info[[i]]) < 5) {encoder_info[[i]][[5]] = 0.01}
+    if (length(encoder_info[[i]]) < 6) {encoder_info[[i]][[6]] = FALSE}
+    if (length(encoder_info[[i]]) < 7) {encoder_info[[i]][[7]] = 0.99 }
+    if (length(encoder_info[[i]]) < 8) {encoder_info[[i]][[8]] = TRUE }
+    
+    if (encoder_info[[i]][[1]] == "dense") {
+      layer_list[[i]] = function(x) { layer <- layer_dense( units = encoder_info[[i]][[2]],  activation = encoder_info[[i]][[3]],
+                                                            kernel_regularizer = if (encoder_info[[i]][[4]] == 1)
+                                                              regularizer_l2(encoder_info[[i]][[5]])
+                                                            else NULL  )
+      if (Lip_en == 1) {
+        layer <- sn(layer, power_iterations = power_iterations)      }
+      layer(x)      }
+    } else if (encoder_info[[i]][[1]] == "dropout") {      layer_list[[i]] = function(x) {
+        layer_dropout(rate = encoder_info[[i]][[2]])(x)      }    }  }
+    
+  encoder_input = layer_input(shape = c(ncol(encoder_input)))
+  encoder_hidden = encoder_input  # Start with the input layer
+  # Add layers dynamically 
+  for (i in 1:length(layer_list)) {
+    if (encoder_info[[i]][[6]]==TRUE){encoder_hidden = encoder_hidden %>% layer_list[[i]]() %>% layer_batch_normalization(momentum = encoder_info[[i]][[7]],scale = encoder_info[[i]][[8]],  center = encoder_info[[i]][[8]]  ) }
+    else {encoder_hidden = encoder_hidden %>% layer_list[[i]]()}
+
+  }
+  z_mean = encoder_hidden %>% layer_dense(units = latent_dim, name = "z_mean")
+  z_log_var = encoder_hidden %>% layer_dense(units = latent_dim, name = "z_log_var")
+  z_sample= Latent_sample(z_mean,z_log_var)
+  z_log_var_clamped = tf$clip_by_value(z_log_var, clip_value_min = -10.0, clip_value_max = 10.0)
+  
+  #Get KL Divergence
+  if (prior == "single_gaussian"){
+  kl_loss_layer = KL_divergenceLayer$new()
+  kl_loss = kl_loss_layer$call(list(z_mean,z_log_var_clamped,beta))
+  }
+  else if (prior == "mixture_gaussian") {
+    kl_loss = list(z_sample, z_mean, z_log_var_clamped, beta) %>%
+      layer_kl_mog(
+        K            = K,   latent_dim   = latent_dim, mog_means    = mog_means,                                
+        mog_log_vars = mog_log_vars,   mog_weights  = mog_weights,   learnable    = learnable_mog,name         = "kl_mog"                                  
+      ) } 
+  
+  #Quality Check
+  shape = tf$shape(z_sample)
+  if (length(shape) != 2){
+    stop(paste("ERROR: The shape of the latent space is not 2; it is", shape))}
+  model = keras_model(encoder_input, list(z_sample,kl_loss), name= "encoder")
+  return(model)} 
+
+
+
+####################################
+#Create custom decoder output layer#
+####################################
+gumbel_softmax = R6Class("Gumbel_layer", inherit = KerasLayer,
+                             public = list(
+                               initialize= function(){},
+                               
+                               call = function(inputs, mask=NULL){ 
+                                 logits = inputs[[1]]
+                                 temperature = inputs[[2]]
+                                 noise = -k_log(-k_log(k_random_uniform(shape = k_shape(logits), minval = 0, maxval = 1)+1e-20)+1e-20)
+                                 logits_scaled = (logits + noise)/ temperature
+                                 output = k_softmax(logits_scaled)
+                                 
+                                 return(output)
+                               }
+                             ))
+
+layer_gumbel_softmax <- function(object) {
+  create_layer(gumbel_softmax, object, list())
+}
+
+
+decoder_activation = function(input, feat_dist, min_val=1e-3, max_std=10.0,guas_scale=1, temperature=0.5){ 
+
+  min_p = 1e-3
+  n_feats <- nrow(feat_dist)
+  decoder_out <- vector("list", n_feats)
+  index_x = 0 
+  
+  #Print the input shape and feat_dist
+  print("Feature distribution data:")
+  print(feat_dist)
+   
+  for (i in seq_len(n_feats)) {
+    feature      <- feat_dist$column_name[i]
+    distribution <- feat_dist$distribution[i]
+    num_params   <- feat_dist$num_params[i]
+    
+    print(paste("Output- Processing feature", feature, "with distribution:", distribution, "and num_params:", num_params, "with index starting at", index_x))
+    
+    if (distribution=="gaussian"){
+      mean = tf$tanh(tf$slice(input, begin=list(0L,as.integer(index_x)), size=list(tf$shape(input)[1], 1L)))*guas_scale #Here we are forcing the first distribution to be Gaussian
+      SD_raw = tf$nn$softplus(tf$slice(input, begin=list(0L, as.integer(index_x+1)), size=list(tf$shape(input)[1], 1L))) 
+      SD = tf$clip_by_value(SD_raw, clip_value_min = min_val, clip_value_max = max_std) 
+      
+      decoder_out[[i]]= tf$concat(list(mean,SD),axis=1L)
+      index_x = index_x + 2L 
+    }
+    
+    else   if (distribution =="bernoulli"){
+      bern_lin = tf$tanh(tf$slice(input, begin=list(0L,as.integer(index_x)), size=list(tf$shape(input)[1], 1L)))
+      bernoulli = (tf$keras$activations$sigmoid(bern_lin)*(1-2*min_p)+min_p) 
+      
+      decoder_out[[i]] = bernoulli
+
+      index_x = index_x + 1L 
+    }
+    else if (distribution =="categorical"){
+      logit = tf$keras$activations$tanh(tf$slice(input, begin = list(0L, as.integer(index_x)), size = list(tf$shape(input)[1], as.integer(num_params))))*10 #this will take the current space up to the num_params -1
+      decoder_out[[i]] = list(logit, temperature) %>% layer_gumbel_softmax()
+      index_x = index_x + num_params 
+    }
+    else {
+      stop("Unknown Distribution:", distribution)  
+    }
+  }
+  decoder_output = layer_concatenate(decoder_out, axis = 1) #this is a keras function to merge together dense output layers by column
+  
+  return(decoder_output) }
+
+#########
+#Decoder#
+#########
+
+decoder_model = function(decoder_input, decoder_info, latent_dim, feat_dist,lip_dec, pi_dec=1,max_std=10.0,min_val=1e3, temperature=0.5){
+
+  sn <- tfa$layers$SpectralNormalization
+  power_iterations <- as.integer(pi_dec)
+  layer_list = list()
+  
+  for (i in 1:length(decoder_info)) {
+    if (length(decoder_info[[i]]) < 4) {decoder_info[[i]][[4]] = 0}
+    if (length(decoder_info[[i]]) < 5) {decoder_info[[i]][[5]] = 0.01}
+    if (length(decoder_info[[i]]) < 6) {decoder_info[[i]][[6]] = FALSE}
+    if (length(decoder_info[[i]]) < 7) {decoder_info[[i]][[7]] = 0.99 }
+    if (length(decoder_info[[i]]) < 8) {decoder_info[[i]][[8]] = TRUE }
+    
+    
+    if (decoder_info[[i]][[1]] == "dense") {
+      layer_list[[i]] = function(x) { layer <- layer_dense( units = decoder_info[[i]][[2]],  activation = decoder_info[[i]][[3]],
+          kernel_regularizer = if (decoder_info[[i]][[4]] == 1)
+            regularizer_l2(decoder_info[[i]][[5]])
+          else NULL
+        )
+        if (lip_dec == 1) {
+          layer <- sn(layer, power_iterations = power_iterations)
+        }
+        layer(x)
+      }
+    } else if (decoder_info[[i]][[1]] == "dropout") {
+      layer_list[[i]] = function(x) {
+        layer_dropout(rate = decoder_info[[i]][[2]])(x)
+      }
+    }
+  }
+    
+  decoder_input = layer_input(shape=c(latent_dim)) 
+  decoder_hidden = decoder_input
+  # Add layers dynamically
+  for (i in 1:length(layer_list)) {
+    if (decoder_info[[i]][[6]]==TRUE){decoder_hidden = decoder_hidden %>% layer_list[[i]]() %>% layer_batch_normalization(momentum = decoder_info[[i]][[7]],scale = decoder_info[[i]][[8]],  center = decoder_info[[i]][[8]]  ) }
+    else {decoder_hidden = decoder_hidden %>% layer_list[[i]]()}
+    
+  }
+  
+  decoder_output = decoder_activation(input=decoder_hidden, feat_dist=feat_dist,max_std=max_std, min_val=min_val,temperature=temperature)
+  model = keras_model(inputs=decoder_input, outputs= decoder_output)
+  return(model)}
+
+
+#############################
+#Create custom loss function#
+#############################
+lossbasedondist = function(input, feat_dist, target,weighted=0, recon_weights){ 
+  index_x = 0 
+  cont_loss_LL = list() 
+  bin_loss_LL = list() 
+  cat_loss_LL = list() 
+  eps = 1e-7  
+  
+  for(index_type in 1:nrow(feat_dist)){  
+    variable = feat_dist[index_type,] 
+    distribution = variable$distribution
+    num_params = variable$num_params
+  
+    # TRACKING: Print the current distribution and num_params and index
+    print(paste("Loss - Processing feature", index_type, "with distribution:", distribution, "and num_params:", num_params, "with index starting at", index_x))
+    
+    if (distribution=="gaussian"){
+      mean = tf$slice(input, begin=list(0L,as.integer(index_x)), size=list(tf$shape(input)[1], 1L)) 
+      SD_raw = tf$slice(input, begin=list(0L,as.integer(index_x+1)), size=list(tf$shape(input)[1], 1L))
+      SD = tf$math$softplus(SD_raw) + 1e-3 
+      
+      ll = 0.5*tf$math$log(2*pi)+tf$math$log(SD)+0.5*tf$square(((tf$slice(target, begin=list(0L,as.integer(index_type-1)), size=list(tf$shape(input)[1], 1L)) - mean)/ SD))
+      #This is the typical negative log likelihood. It pulls the true target mean, and uses the VAE output SD and mean 
+      
+      cont_loss_LL[[index_type]]= tf$reduce_mean(ll) 
+      index_x = index_x + 2 
+    }
+    else   if (distribution =="bernoulli"){
+      prob_crude = tf$slice(input, begin=list(0L,as.integer(index_x)), size=list(tf$shape(input)[1], 1L))
+      prob = tf$clip_by_value(prob_crude, eps, 1 - eps)
+      
+      ll = -(tf$slice(target, begin=list(0L,as.integer(index_type-1)), size=list(tf$shape(input)[1], 1L))*tf$math$log(prob)+(1-tf$slice(target, begin=list(0L,as.integer(index_type-1)), size=list(tf$shape(input)[1], 1L)))*tf$math$log(1-prob))
+
+      bin_loss_LL[[index_type]]= tf$reduce_mean(ll) 
+      index_x = index_x + 1 
+    }
+    else if (distribution =="categorical"){
+      
+      logit_crude = tf$slice(input, begin = list(0L, as.integer(index_x)), size = list(tf$shape(input)[1], as.integer(num_params))) #this will take the current space up to the num_params -1
+      logit = tf$clip_by_value(logit_crude, eps, 1 - eps)
+      
+      ll = -tf$math$log(logit)*tf$slice(target, begin = list(0L, as.integer(index_type-1)), size = list(tf$shape(input)[1], as.integer(num_params)))
+      #This is the typical negative log likelihood for categorical, 
+      
+      cat_loss_LL[[index_type]]= tf$reduce_mean(ll)
+      index_x = index_x + num_params 
+    }
+  else {
+    stop("Unknown:", distribution) 
+  }}
+  
+  #Get rid of nulls so we do not have nulls when the indiex was not of that type
+  cont_loss_LL <- cont_loss_LL[!sapply(cont_loss_LL, is.null)]
+  bin_loss_LL  <- bin_loss_LL[!sapply(bin_loss_LL,  is.null)]
+  cat_loss_LL  <- cat_loss_LL[!sapply(cat_loss_LL,  is.null)]
+    
+  cont_group_loss <- tf$reduce_mean(tf$stack(cont_loss_LL, axis = 0L),axis = 0L  )
+  bin_group_loss  <- tf$reduce_mean(tf$stack(bin_loss_LL,  axis = 0L),axis = 0L  )
+  cat_group_loss  <- tf$reduce_mean(tf$stack(cat_loss_LL,  axis = 0L),  axis = 0L )
+  
+  if (weighted == 0) {
+    w_cont <- tf$constant(1.0, dtype = cont_group_loss$dtype)
+    w_bin  <- tf$constant(1.0, dtype = bin_group_loss$dtype)
+    w_cat  <- tf$constant(1.0, dtype = cat_group_loss$dtype)
+  }
+  else if (weighted == 1) {
+    w_cont <-  tf$constant(recon_weights[[1]], dtype = cont_group_loss$dtype)
+    w_bin  <-  tf$constant(recon_weights[[2]], dtype = bin_group_loss$dtype)
+    w_cat  <-  tf$constant(recon_weights[[3]], dtype = cat_group_loss$dtype)}
+  
+  group_losses <- tf$stack(list(cont_group_loss, bin_group_loss, cat_group_loss),  axis = 0L )
+  
+  group_weights <- tf$stack(list(w_cont, w_bin,  w_cat),axis = 0L)
+
+  weighted_groups   <- tf$multiply(group_weights, group_losses)   
+  total_loss        <- tf$reduce_sum(weighted_groups, axis = 0L)  
+  
+  print(paste("Loss - total", total_loss)) 
+  return(list(total_loss,cont_group_loss,bin_group_loss,cat_group_loss) )  }
+
+
+###############
+#VAE Framework#
+###############
+#Played arounf with optimizer 
+model_VAE = function(data, encoder_info, decoder_info,Lip_en, pi_enc=1,lip_dec, pi_dec=1,latent_dim, feat_dist, lr, beta,max_std=10.0,min_val, temperature=0.5,weighted=0, recon_weights, seperate = 0,prior="single_gaussian",K =3,learnable_mog=FALSE,mog_means=NULL, mog_log_vars=NULL, mog_weights=NULL ){
+  #prep data 
+  input_data <-  as.matrix(data)
+  #encoder
+  encoder = encoder_model(encoder_input=input_data, encoder_info=encoder_info, latent_dim=latent_dim, beta=beta,Lip_en=Lip_en, pi_enc=pi_enc,prior=prior,K=K,learnable_mog=learnable_mog,mog_means=mog_means, mog_log_vars=mog_log_vars, mog_weights=mog_weights )
+     
+  #Decoder
+  decoder = decoder_model(encoder$output[[1]], decoder_info=decoder_info,latent_dim=latent_dim, feat_dist=feat_dist,lip_dec=lip_dec, pi_dec=pi_dec,max_std=max_std , min_val=min_val,temperature = temperature )
+  
+  #Define VAE model 
+  vae = keras_model(inputs = encoder$input, outputs= decoder(encoder$output[[1]]))
+  
+  #make the KL that is calculated in the encoder as part of the loss 
+  kl_loss = encoder$output[[2]] 
+  vae$add_loss(kl_loss)
+  #add reconstruction loss as part of the loss
+  reconstruction_loss = lossbasedondist(vae$output, feat_dist , encoder$input,weighted=weighted, recon_weights)
+  vae$add_loss(reconstruction_loss[[1]])
+  
+  #Looking at losses separate 
+  vae$add_metric(kl_loss, name = "kl_loss", aggregation = "mean")
+  vae$add_metric(reconstruction_loss[[1]], name = "recon_loss", aggregation = "mean")
+  if (seperate == 1) {
+  vae$add_metric(reconstruction_loss[[2]], name = "cont_loss", aggregation = "mean")
+  vae$add_metric(reconstruction_loss[[3]], name = "bin_loss", aggregation = "mean")
+  vae$add_metric(reconstruction_loss[[4]], name = "cat_loss", aggregation = "mean")}
+  
+  #compile (optimization options, comment "in" the one you want to use)
+  optimizer = optimizer_adam(learning_rate = lr, clipnorm = 0.1) 
+  #optimizer = optimizer_sgd(learning_rate = lr, momentum = 0.7, nesterov = FALSE)
+  #optimizer = optimizer_rmsprop(learning_rate = lr, rho = 0.8, momentum = 0.6, epsilon = 1e-07) #Squashed binary
+  #optimizer = optimizer_adagrad(learning_rate = lr, initial_accumulator_value = 5, epsilon = 1e-07)
+  #optimizer = optimizer_adadelta(learning_rate = lr, rho = 0.95, epsilon = 1e-07) #Did not work great on Optimum data
+  #optimizer = optimizer_adamax(learning_rate = lr, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-07)
+  #optimizer = optimizer_nadam(learning_rate = lr, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-07)
+
+  vae %>% compile(optimizer=optimizer, loss = NULL)
+  return(vae)
+}
+
+
+
+LossPrinterCallback <- R6::R6Class(
+  "LossPrinterCallback",
+  inherit = KerasCallback,
+  
+  public = list(
+    on_epoch_end = function(epoch, logs = list()) {
+      cat(sprintf("Epoch %d: Continuous Loss = %.4f | Binary Loss = %.4f | Categorical Loss = %.4f \n",
+                  epoch + 1,
+                  logs[["cont_loss"]],
+                  logs[["bin_loss"]],
+                  logs[["cat_loss"]]))
+    }  ))
+
+
+##############
+#VAE Training#
+##############
+VAE_train = function(data,encoder_info, decoder_info,Lip_en, pi_enc=1,lip_dec, pi_dec=1, latent_dim, epoch, beta,kl_warm=FALSE,kl_cyclical = FALSE, n_cycles, ratio, beta_epoch=15, temperature, temp_warm = FALSE,temp_epoch,batchsize, wait, min_delta, lr,max_std=10.0,min_val,weighted=0, recon_weights, seperate = 0,prior="single_gaussian",K =3,learnable_mog=FALSE,mog_means=NULL, mog_log_vars=NULL, mog_weights=NULL){
+  EarlyStop = callback_early_stopping(monitor='val_recon_loss', patience=wait, min_delta=min_delta,restore_best_weights = TRUE)
+  
+  # Setup beta (fixed or dynamic)
+  if (kl_warm) {
+    if (kl_cyclical){
+      beta_dynamic = cyclical_beta_callback(beta_max = beta, total_epochs = epoch, n_cycles = n_cycles, ratio = ratio)
+    } else {
+    beta_dynamic = beta_callback(beta_max = beta, warmup_epochs = beta_epoch)
+    }
+    beta_used = beta_dynamic$beta_var
+    beta_callback_list = list(beta_dynamic$callback)
+  } else {
+    beta_used = k_variable(beta, dtype = "float32", name = "beta_fixed")
+    beta_callback_list = list()
+  }
+  
+  # Setup temperature (fixed or dynamic)
+  if (temp_warm) {
+    temp_dynamic = temperature_callback(temperature = temperature, warmup_epochs = temp_epoch)
+    temp_used = temp_dynamic$temp_var
+    temp_callback_list = list(temp_dynamic$callback)
+  } else {
+    temp_used = k_variable(temperature, dtype = "float32", name = "temp_fixed")
+    temp_callback_list = list()
+  }
+  
+  run_vae = model_VAE(data=data, encoder_info=encoder_info, decoder_info=decoder_info,Lip_en=Lip_en, pi_enc=pi_enc,lip_dec=lip_dec, pi_dec=pi_dec, latent_dim=latent_dim, feat_dist=feat_dist, lr=lr , beta=beta_used,max_std=max_std, min_val=min_val,temperature=temp_used,weighted=weighted, recon_weights=recon_weights, seperate=seperate,prior=prior,K =K,learnable_mog=learnable_mog,mog_means=mog_means, mog_log_vars=mog_log_vars, mog_weights=mog_weights)
+  
+  #Tracking loss as we go
+  loss_history <<-list()
+  loss_tracked = callback_lambda(on_epoch_end = function(epoch,logs){
+    print(paste("Epoch", epoch+1, "Loss:", logs$loss, "Recon",logs$recon_loss, "KL_loss",logs$kl_loss  ))
+    loss_history[[epoch+1]] <<- logs$loss
+  })
+  
+  if (seperate == 1){callbacks = c(list(EarlyStop, loss_tracked),beta_callback_list,temp_callback_list,LossPrinterCallback$new())}
+  else if (seperate == 0) { callbacks = c(list(EarlyStop, loss_tracked),beta_callback_list,temp_callback_list)}
+
+  input_data <- as.matrix(data)
+  
+  run_vae %>% fit(input_data, input_data, epochs = epoch, batch_size = batchsize, validation_split = 0.2, callbacks=callbacks)
+ 
+  
+  return(list(trained_model = run_vae, loss_history = loss_history))
+}
+
+
+# Function to reset all random seeds in R (and TensorFlow)
+#42 was randomly picked, feel free to change! 
+reset_seeds <- function() {
+  # Reset TensorFlow/Keras session and clear the graph
+  tf$compat$v1$reset_default_graph()
+  keras::k_clear_session()  # Optional, clears the Keras session
+  # Set R random seed
+  set.seed(42)  # You can change this to your preferred seed value
+  # Set TensorFlow random seed
+  tf$random$set_seed(42)  # You can change this to your preferred seed value
+  # Import and set Python's random seed (via reticulate)
+  py_random <- import("random")  # Import Python's random module
+  py_random$seed(42)  # Set Python's random seed
+  cat("Random seeds reset\n")
+}
